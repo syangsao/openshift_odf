@@ -7,7 +7,7 @@ summary report.  Components checked:
 
   - ODF Operator & Cluster versions
   - StorageCluster status
-  - Ceph health (overall + OSDs + MONs + MGRs)
+  - Ceph health (overall + OSDs + MONs + MGRs) — if Ceph pods exist
   - Ceph capacity / utilization
   - NooBaa / MCG status (core, backing stores, buckets)
   - NooBaa version mismatch (core vs. backing-store agents)
@@ -153,6 +153,11 @@ def resolve_config(args) -> tuple:
 
 # ── oc Command Execution ─────────────────────────────────────────────────────
 
+def expand_path(p: str) -> str:
+    """Expand ~ and env vars in a path string locally."""
+    return os.path.expandvars(os.path.expanduser(p))
+
+
 def oc(
     args: list,
     mode: str,
@@ -161,22 +166,29 @@ def oc(
     check: bool = True,
     timeout: int = 60,
 ) -> subprocess.CompletedProcess:
-    """Dispatch oc command based on connection mode."""
-    env = None
-    if kubeconfig:
-        kc_path = Path(kubeconfig).expanduser()
-        if kc_path.exists():
-            env = {**os.environ, "KUBECONFIG": str(kc_path)}
+    """Dispatch oc command based on connection mode.
 
+    When namespace is empty string, the command runs without -n (cluster-scoped).
+    """
+    ns_flag = f"-n {namespace}" if namespace else ""
     if mode == "direct":
-        cmd = ["oc", "-n", namespace] + args
+        env = None
+        if kubeconfig:
+            kc_path = expand_path(kubeconfig)
+            if Path(kc_path).exists():
+                env = {**os.environ, "KUBECONFIG": kc_path}
+            else:
+                env = {**os.environ, "KUBECONFIG": kubeconfig}
+        cmd = ["oc"] + (["-n", namespace] if namespace else []) + args
         return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout, env=env)
     else:
+        ssh_key_expanded = expand_path(ssh_key)
+        remote_kc = kubeconfig if kubeconfig else ""
         oc_args_str = " ".join(args)
-        kc_path = Path(kubeconfig).expanduser() if kubeconfig else ""
         full_cmd = (
-            f"ssh -i {ssh_key} {ssh_user}@{ssh_host} "
-            f"'KUBECONFIG={kc_path} oc -n {namespace} {oc_args_str}'"
+            f"ssh -i {ssh_key_expanded} -o StrictHostKeyChecking=no "
+            f"{ssh_user}@{ssh_host} "
+            f"'KUBECONFIG={remote_kc} oc {ns_flag} {oc_args_str}'"
         )
         return subprocess.run(full_cmd, shell=True, capture_output=True, text=True, check=check, timeout=timeout)
 
@@ -202,33 +214,19 @@ def oc_get_json(path: str, mode: str, ssh_host: str, ssh_user: str, ssh_key: str
 # ── Check Functions ──────────────────────────────────────────────────────────
 
 def check_cluster_operators(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
-    """Check ODF-related ClusterOperator status."""
+    """Check ODF-related operator deployments."""
     section("CLUSTER OPERATORS")
     findings = []
     try:
-        result = oc(["get", "co", "-o", "jsonpath={.items[?(@.spec.serviceAccountName=='ocs-operator')].metadata.name}"],
-                     mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
-        # Broader approach: get all COs and filter
-        co_data = oc_get_json("clusterversions/version", mode, ssh_host, ssh_user, ssh_key, "", kubeconfig)
-        if co_data and "status" in co_data and "conditions" in co_data.get("status", {}):
-            for cond in co_data["status"]["conditions"]:
-                if "odf" in cond.get("type", "").lower() or "ocs" in cond.get("type", "").lower():
-                    status = "HEALTHY" if cond.get("status") == "True" else "DEGRADED"
-                    msg = f"  {cond['type']}: {status}"
-                    if status == "HEALTHY":
-                        success(msg)
-                    else:
-                        warn(msg)
-                    findings.append({"type": cond["type"], "status": status})
-        # Fallback: check OCS/ODF operators
-        for op in ["ocs-operator", "odf-operator"]:
+        # Check OCS/ODF operator deployments
+        for op in ["ocs-operator", "odf-operator-controller-manager"]:
             try:
                 r = oc(["get", "deployment", op, "-o", "jsonpath={.status.readyReplicas}"],
-                        mode, ssh_host, ssh_user, ssh_key, "openshift-storage", kubeconfig, check=False)
+                        mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
                 if r.returncode == 0 and r.stdout.strip():
                     ready = r.stdout.strip()
                     spec = oc(["get", "deployment", op, "-o", "jsonpath={.spec.replicas}"],
-                               mode, ssh_host, ssh_user, ssh_key, "openshift-storage", kubeconfig, check=False)
+                               mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
                     desired = spec.stdout.strip() if spec.returncode == 0 else "?"
                     if ready == desired and ready != "0":
                         success(f"  {op}: {ready}/{desired} ready")
@@ -238,12 +236,29 @@ def check_cluster_operators(mode, ssh_host, ssh_user, ssh_key, namespace, kubeco
                         findings.append({"type": op, "status": "DEGRADED"})
             except Exception:
                 pass
+
+        # Check cluster version for ODF conditions
+        try:
+            co_data = oc_get_json("clusterversion/version", mode, ssh_host, ssh_user, ssh_key, "", kubeconfig)
+            if co_data and "status" in co_data:
+                for cond in co_data.get("status", {}).get("conditions", []):
+                    ctype = cond.get("type", "")
+                    if "odf" in ctype.lower() or "ocs" in ctype.lower():
+                        status = "HEALTHY" if cond.get("status") == "True" else "DEGRADED"
+                        msg = f"  {ctype}: {status}"
+                        if status == "HEALTHY":
+                            success(msg)
+                        else:
+                            warn(msg)
+                        findings.append({"type": ctype, "status": status})
+        except Exception:
+            pass
     except Exception as e:
         warn(f"  Could not check cluster operators: {e}")
         findings.append({"type": "cluster_operators", "status": "UNKNOWN", "error": str(e)})
 
     if not findings:
-        info("  No ODF-specific cluster operators found (may be OCS-only deployment)")
+        info("  No ODF-specific operators found")
 
     return findings
 
@@ -258,11 +273,12 @@ def check_storagecluster(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfi
         findings.append({"type": "storagecluster", "status": "UNKNOWN"})
         return findings
 
-    items = sc_data.get("items", [sc_data])  # handle List or single resource
+    items = sc_data.get("items", [sc_data])
     for sc in items:
         name = sc.get("metadata", {}).get("name", "unknown")
         phase = sc.get("status", {}).get("phase", "Unknown")
-        msg = f"  {name}: phase={phase}"
+        version = sc.get("status", {}).get("version", "unknown")
+        msg = f"  {name}: phase={phase} (v{version})"
         if phase == "Ready":
             success(msg)
             findings.append({"type": "storagecluster", "name": name, "status": "HEALTHY"})
@@ -270,12 +286,17 @@ def check_storagecluster(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfi
             warn(msg)
             findings.append({"type": "storagecluster", "name": name, "status": "DEGRADED"})
 
-        # Check conditions
+        # Check conditions — conditions like Degraded, VersionMismatch are
+        # healthy when status is "False" (condition not present).
+        # Conditions like Ready, Upgradeable are healthy when status is "True".
+        negative_conditions = {"Degraded", "VersionMismatch", "FailureDomainHostError", "Progressing"}
         conditions = sc.get("status", {}).get("conditions", [])
         for cond in conditions:
             ctype = cond.get("type", "")
             cstatus = cond.get("status", "")
-            if cstatus != "True" and ctype not in ("Progressing",):
+            is_healthy = (cstatus == "False" and ctype in negative_conditions) or \
+                         (cstatus == "True" and ctype not in negative_conditions)
+            if not is_healthy:
                 reason = cond.get("reason", "")
                 msg2 = f"    Condition {ctype}: {cstatus} — {reason}"
                 warn(msg2)
@@ -284,12 +305,29 @@ def check_storagecluster(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfi
     return findings
 
 
+def _has_ceph_pods(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig) -> bool:
+    """Check if there are any rook-ceph MON/OSD pods (full Ceph vs standalone MCG)."""
+    try:
+        r = oc(["get", "pods", "-l", "app=rook-ceph-mon", "--no-headers"],
+                mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def check_ceph_health(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
-    """Check Ceph cluster health."""
+    """Check Ceph cluster health (only if Ceph pods exist)."""
     section("CEPH HEALTH")
     findings = []
 
-    # Get Ceph health from rook-ceph-mon pod
+    if not _has_ceph_pods(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
+        info("  No Ceph MON/OSD pods found (standalone MCG deployment)")
+        info("  Ceph health checks skipped")
+        findings.append({"type": "ceph_health", "status": "HEALTHY", "detail": "No Ceph (standalone MCG)"})
+        return findings
+
     try:
         # Find the mon pod
         mon_pods = oc(["get", "pods", "-l", "app=rook-ceph-mon", "-o", "jsonpath={.items[0].metadata.name}"],
@@ -328,7 +366,6 @@ def check_ceph_health(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
                 findings.append({"type": f"ceph_warn_{msg_key.lower().replace(' ', '_')}", "status": "WARN"})
 
             # OSDs
-            osds = ceph.get("fsid")  # just check we got data
             osdmap = ceph.get("osd", {})
             osd_up = osdmap.get("osds_up", 0)
             osd_in = osdmap.get("osds_in", 0)
@@ -383,59 +420,6 @@ def check_ceph_health(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
     return findings
 
 
-def check_ceph_pods(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
-    """Check Ceph-related pod statuses."""
-    section("CEPH PODS")
-    findings = []
-
-    try:
-        result = oc([
-            "get", "pods", "-l", "app=rook-ceph-mon",
-            "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount",
-            "--no-headers"
-        ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig)
-        for line in result.stdout.strip().split("\n"):
-            parts = line.split()
-            if len(parts) >= 3:
-                name, status, restarts = parts[0], parts[1], parts[2]
-                if status == "Running" and restarts == "0":
-                    success(f"  {name}: {status} (restarts: {restarts})")
-                    findings.append({"type": f"pod_{name}", "status": "HEALTHY"})
-                elif status == "Running":
-                    info(f"  {name}: {status} (restarts: {restarts})")
-                    findings.append({"type": f"pod_{name}", "status": "HEALTHY", "restarts": int(restarts)})
-                else:
-                    error(f"  {name}: {status}")
-                    findings.append({"type": f"pod_{name}", "status": "DEGRADED"})
-    except Exception as e:
-        warn(f"  Could not check MON pods: {e}")
-
-    # Check OSD pods
-    try:
-        result = oc([
-            "get", "pods", "-l", "app=rook-ceph-osd",
-            "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount",
-            "--no-headers"
-        ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig)
-        for line in result.stdout.strip().split("\n"):
-            parts = line.split()
-            if len(parts) >= 3:
-                name, status, restarts = parts[0], parts[1], parts[2]
-                if status == "Running" and restarts == "0":
-                    success(f"  {name}: {status} (restarts: {restarts})")
-                    findings.append({"type": f"pod_{name}", "status": "HEALTHY"})
-                elif status == "Running":
-                    info(f"  {name}: {status} (restarts: {restarts})")
-                    findings.append({"type": f"pod_{name}", "status": "HEALTHY", "restarts": int(restarts)})
-                else:
-                    error(f"  {name}: {status}")
-                    findings.append({"type": f"pod_{name}", "status": "DEGRADED"})
-    except Exception as e:
-        warn(f"  Could not check OSD pods: {e}")
-
-    return findings
-
-
 def check_nooobaa_status(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
     """Check NooBaa / MCG component status."""
     section("NOOBAA / MCG")
@@ -458,11 +442,11 @@ def check_nooobaa_status(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfi
     except Exception as e:
         warn(f"  Could not check NooBaa CR: {e}")
 
-    # NooBaa pods
+    # NooBaa pods — use app=noobaa label
     try:
         result = oc([
-            "get", "pods", "-l", "noobaa.io/noobaa",
-            "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount",
+            "get", "pods", "-l", "app=noobaa",
+            "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[:1].restartCount",
             "--no-headers"
         ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
         if result.returncode == 0:
@@ -507,9 +491,9 @@ def check_version_mismatch(mode, ssh_host, ssh_user, ssh_key, namespace, kubecon
         core_image = core_result.stdout.strip()
         core_version = core_image.split("/")[-1].split("@")[0]
 
-        # Get agent image
+        # Get agent image — use backingstore=noobaa label
         agent_result = oc([
-            "get", "pods", "-l", "backingstore-name=noobaa-default-backing-store",
+            "get", "pods", "-l", "backingstore=noobaa",
             "-o", "jsonpath={.items[0].spec.containers[0].image}"
         ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
 
@@ -546,10 +530,18 @@ def check_pg_replica(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
     findings = []
 
     try:
+        # Try the NooBaa-specific CNPG kind first, then standard CNPG
         cluster_result = oc([
             "get", "clusters.postgresql.cnpg.noobaa.io", "noobaa-db-pg-cluster",
             "-o", "jsonpath={.status.instances},{.status.readyInstances},{.status.phase}"
         ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
+
+        if cluster_result.returncode != 0:
+            # Fallback to standard CNPG kind
+            cluster_result = oc([
+                "get", "clusters.postgresql.cnpg.io", "noobaa-db-pg-cluster",
+                "-o", "jsonpath={.status.instances},{.status.readyInstances},{.status.phase}"
+            ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
 
         if cluster_result.returncode == 0:
             status = cluster_result.stdout.strip()
@@ -573,7 +565,7 @@ def check_pg_replica(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig):
 
         # Check for stuck replicas
         pods_result = oc([
-            "get", "pods", "-l", "cluster-name=noobaa-db-pg-cluster", "--no-headers"
+            "get", "pods", "-l", "cnpg.io/cluster=noobaa-db-pg-cluster", "--no-headers"
         ], mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfig, check=False)
 
         if pods_result.returncode == 0:
@@ -636,8 +628,6 @@ def check_problematic_pods(mode, ssh_host, ssh_user, ssh_key, namespace, kubecon
             name = parts[0]
             status = parts[1]
 
-            # Extract the actual status (CrashLoopBackOff appears in the running state)
-            # Check container statuses more carefully
             if status == "Running":
                 running += 1
             elif status in unhealthy_statuses:
@@ -682,7 +672,7 @@ def check_storageclasses(mode, ssh_host, ssh_user, ssh_key, namespace, kubeconfi
                 if len(parts) >= 3:
                     name, provisioner, default = parts[0], parts[1], parts[2]
                     default_marker = " (default)" if default == "true" else ""
-                    if "openshift-storage" in provisioner or "cephfs.csi.ceph.com" in provisioner or "ceph.rbd.csi.ceph.com" in provisioner:
+                    if "openshift-storage" in provisioner or "cephfs.csi.ceph.com" in provisioner or "ceph.rbd.csi.ceph.com" in provisioner or "noobaa.io" in provisioner:
                         success(f"  {name}{default_marker} — {provisioner}")
                         findings.append({"type": f"sc_{name}", "status": "HEALTHY"})
                     else:
@@ -871,8 +861,6 @@ Examples:
                                                      config["SSH_KEY"], ns, config["KUBECONFIG"]))
             all_findings.extend(check_ceph_health(mode, config["SSH_HOST"], config["SSH_USER"],
                                                   config["SSH_KEY"], ns, config["KUBECONFIG"]))
-            all_findings.extend(check_ceph_pods(mode, config["SSH_HOST"], config["SSH_USER"],
-                                                config["SSH_KEY"], ns, config["KUBECONFIG"]))
             all_findings.extend(check_nooobaa_status(mode, config["SSH_HOST"], config["SSH_USER"],
                                                      config["SSH_KEY"], ns, config["KUBECONFIG"]))
             all_findings.extend(check_version_mismatch(mode, config["SSH_HOST"], config["SSH_USER"],
